@@ -51,4 +51,4 @@ Un sistema completo con backend REST, frontend Angular, seguridad JWT e integrac
 
 ---
 
-*Programación Avanzada — Semestre 2025-II — Facultad de Ingeniería*
+*Programación Avanzada — Semestre 2026-I — Facultad de Ingeniería*
