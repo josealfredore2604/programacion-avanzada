@@ -624,6 +624,139 @@ curl http://localhost:8080/actuator/health
 
 > **Nota sobre `host.docker.internal`:** Cuando un contenedor Docker necesita conectarse a un servicio que corre en la máquina anfitriona (como el PostgreSQL que instalaste directamente), usa `host.docker.internal` en lugar de `localhost`. En Docker Compose esto no es necesario porque todos los contenedores están en la misma red interna.
 
+### Dockerfile para Spring Boot con Gradle (en lugar de Maven)
+
+Si tu proyecto usa Gradle en lugar de Maven, el Dockerfile multi-stage cambia en algunos puntos clave. La lógica es la misma, pero los archivos de configuración, los comandos y la ubicación del JAR final son diferentes.
+
+**¿Cuándo usás Gradle?** Cuando tu proyecto tiene `build.gradle` (o `build.gradle.kts`) en la raíz en lugar de `pom.xml`. Al crear el proyecto en Spring Initializr podés elegir entre los dos.
+
+```dockerfile
+# ============================================================
+# Dockerfile para triage-backend con GRADLE (multi-stage build)
+# Diferencias clave respecto a la versión Maven:
+#   - Se copia el Gradle Wrapper antes del código fuente
+#   - El JAR queda en build/libs/, no en target/
+#   - Se usa --no-daemon para evitar problemas de memoria en CI
+# ============================================================
+
+# ─────────────────────────────────────────────────────────────
+# ETAPA 1: BUILD
+# ─────────────────────────────────────────────────────────────
+FROM eclipse-temurin:21-jdk-alpine AS build
+
+WORKDIR /app
+
+# Copiar primero el Gradle Wrapper y los archivos de configuración.
+# Si build.gradle no cambia, Docker reutiliza esta capa en el
+# próximo build y NO vuelve a descargar las dependencias de internet.
+COPY gradlew gradlew.bat ./
+COPY gradle/ gradle/
+COPY build.gradle settings.gradle ./
+# Si tenés gradle.properties, descomentá la siguiente línea:
+# COPY gradle.properties ./
+
+# Dar permisos de ejecución al wrapper (Linux no preserva el bit +x
+# de archivos creados en Windows — hay que agregarlo explícitamente)
+RUN chmod +x gradlew
+
+# Pre-descargar dependencias para cachear esta capa
+# El "|| true" evita que falle si hay problemas menores de red
+RUN ./gradlew dependencies --no-daemon || true
+
+# Copiar el código fuente
+COPY src ./src
+
+# Compilar. --no-daemon es CRUCIAL en CI/contenedores:
+# el daemon de Gradle puede causar OOMKilled en entornos con poca RAM
+RUN ./gradlew bootJar -x test --no-daemon
+
+# ─────────────────────────────────────────────────────────────
+# ETAPA 2: RUNTIME — idéntica a la versión Maven
+# ─────────────────────────────────────────────────────────────
+FROM eclipse-temurin:21-jre-alpine AS runtime
+
+LABEL maintainer="Jose Alfredo Ramirez <jramirez@uniquindio.edu.co>"
+LABEL description="Backend del Sistema de Triage - Programación Avanzada UniQuindío"
+
+RUN addgroup -S triage && adduser -S triage -G triage
+WORKDIR /app
+
+# Gradle genera DOS JARs en build/libs/:
+#   triage-backend-0.0.1-SNAPSHOT.jar        ← fat JAR (contiene dependencias)
+#   triage-backend-0.0.1-SNAPSHOT-plain.jar  ← solo clases, no sirve para correr
+# El patrón *-[0-9]*.jar coincide con el fat JAR (tiene versión en el nombre)
+COPY --from=build /app/build/libs/*-[0-9]*.jar triage-backend.jar
+
+RUN chown triage:triage triage-backend.jar
+USER triage
+
+EXPOSE 8080
+ENV SPRING_PROFILES_ACTIVE=prod
+
+ENTRYPOINT ["java", \
+  "-XX:+UseContainerSupport", \
+  "-XX:MaxRAMPercentage=75.0", \
+  "-Djava.security.egd=file:/dev/./urandom", \
+  "-jar", "triage-backend.jar"]
+```
+
+> **El problema de los dos JARs de Gradle:** El plugin Spring Boot de Gradle genera automáticamente dos JARs. Si usás el patrón genérico `build/libs/*.jar`, el `COPY` fallará porque hay dos archivos y Docker no sabe cuál copiar. Para evitarlo, usá `*-[0-9]*.jar` como en el ejemplo, o deshabilitá el plain JAR en `build.gradle`:
+> ```groovy
+> // build.gradle — deshabilitar generación del JAR sin dependencias
+> jar { enabled = false }
+> ```
+
+#### Tabla comparativa Maven vs Gradle en Docker
+
+| Aspecto | Maven | Gradle |
+|---|---|---|
+| **Archivo de configuración** | `pom.xml` | `build.gradle` / `build.gradle.kts` |
+| **Comando de build** | `mvn clean package -DskipTests -B` | `./gradlew bootJar -x test --no-daemon` |
+| **Ubicación del JAR** | `target/*.jar` | `build/libs/*-[0-9]*.jar` |
+| **Archivos para cachear dependencias** | `COPY pom.xml .` | `COPY gradlew gradlew.bat gradle/ build.gradle settings.gradle .` |
+| **Pre-descargar dependencias** | `RUN mvn dependency:go-offline -B` | `RUN ./gradlew dependencies --no-daemon \|\| true` |
+| **Permisos en Linux** | No necesario | `RUN chmod +x gradlew` |
+| **Directorio de caché local** | `~/.m2/repository` | `~/.gradle/caches` |
+| **Excluir en `.dockerignore`** | `target/` | `build/` y `.gradle/` |
+
+#### El `.dockerignore` actualizado para Gradle
+
+```dockerignore
+# .dockerignore para triage-backend con Gradle
+
+# Resultado del build (Docker recompilará dentro del contenedor)
+build/
+
+# Caché local de Gradle (pesada, no necesaria en el contenedor)
+.gradle/
+
+# IMPORTANTE: NO excluir gradle/wrapper/ ni gradlew
+# El Dockerfile ejecuta ./gradlew — si no está, el build falla
+
+# Archivos del IDE
+.idea/
+*.iml
+.vscode/
+
+# Git
+.git/
+.gitignore
+
+# Variables de entorno locales
+.env
+.env.local
+
+# Logs
+*.log
+logs/
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+```
+
+> **¿Por qué no excluir `gradlew` ni `gradle/wrapper/`?** A diferencia de Maven (que se instala en la imagen base `maven:3.9`), Gradle se ejecuta a través del wrapper incluido en tu repositorio. Si excluís esos archivos del contexto de construcción, el `RUN ./gradlew ...` fallará con `sh: ./gradlew: not found`.
+
 ---
 
 ## 6. Dockerfile para Angular con Nginx
@@ -733,7 +866,7 @@ export const environment = {
 };
 ```
 
-> **¿Por qué `/api/v1` relativo?** Cuando frontend y backend están en el mismo dominio (o Nginx hace de proxy), usar rutas relativas es más limpio. Nginx intercepta las peticiones a `/api/v1/...` y las redirige al backend. Esto evita problemas de CORS en producción.
+> **¿Por qué `/api/v1` relativo?** Cuando frontend y backend están en el mismo dominio (o Nginx hace de proxy), usar rutas relativas es más limpio. Nginx intercepta las peticiones a `/api/v1/...` y las redirige al backend. Esto evita problemas de CORS en producción. (ver [¿Qué es un Proxy Inverso?](#qué-es-un-proxy-inverso) para la explicación completa).
 
 ### El Dockerfile del frontend
 
@@ -806,6 +939,86 @@ Este es uno de los pasos más importantes y donde muchos estudiantes cometen err
 En una SPA, el routing lo maneja JavaScript en el navegador. Cuando el usuario navega a `https://triage.app/solicitudes/123`, el servidor recibe esa petición. Nginx busca un archivo en `/usr/share/nginx/html/solicitudes/123/index.html`... que no existe. Resultado: **404 Not Found**.
 
 La solución es decirle a Nginx: "si el archivo no existe, devuelve siempre `index.html` y deja que Angular maneje el routing".
+
+### ¿Qué es un Proxy Inverso?
+
+Antes de ver la configuración de Nginx, necesitás entender el concepto de **proxy inverso** porque lo vas a ver en toda la guía: en Nginx, en Vercel, y es el mecanismo que resuelve el problema de CORS en producción.
+
+#### La analogía de la recepción
+
+Imaginá que llegás a un edificio de oficinas y le preguntás a la recepcionista: "necesito hablar con alguien de Recursos Humanos". La recepcionista te dice "un momento" y llama internamente. Vos nunca sabés exactamente con quién habló ni en qué piso están. Solo recibís la respuesta.
+
+Eso es exactamente un **proxy inverso**: un intermediario que recibe tus peticiones, las redirige al servicio interno correcto, y te devuelve la respuesta. Vos solo ves al intermediario.
+
+```
+SIN PROXY INVERSO:
+
+  Navegador  ──── GET /api/solicitudes ────►  ┌─────────────────┐
+  (puerto 4200)                                │ Spring Boot     │
+                                               │ puerto 8080     │
+                                               └─────────────────┘
+  ❌ El navegador hace la petición directamente al backend.
+     El origen del frontend (localhost:4200) ≠ origen del backend
+     (localhost:8080) → el navegador bloquea la respuesta (CORS error).
+
+
+CON PROXY INVERSO (Nginx):
+
+  Navegador  ──── GET /api/solicitudes ────►  ┌─────────────────┐
+  (puerto 80)                                  │ Nginx           │
+                                               │ puerto 80       │
+                                               │  ↓ proxy_pass   │ ──► Spring Boot
+                                               └─────────────────┘     puerto 8080
+
+  ✅ El navegador solo conoce a Nginx (puerto 80).
+     Tanto el HTML/JS como las peticiones /api/* vienen del mismo
+     origen (puerto 80). No hay CORS porque no hay cambio de origen.
+```
+
+#### La diferencia entre proxy directo y proxy inverso
+
+Un **proxy directo** actúa en nombre del *cliente* (el navegador). Lo usás cuando querés que tu tráfico salga por otro servidor — por ejemplo, una VPN o un proxy de empresa.
+
+Un **proxy inverso** actúa en nombre del *servidor* (el backend). Lo configura el equipo del servidor para proteger, balancear o redirigir las peticiones que llegan.
+
+```
+PROXY DIRECTO:                    PROXY INVERSO:
+Cliente → Proxy → Internet        Internet → Proxy → Servidor
+(actúa en nombre del cliente)     (actúa en nombre del servidor)
+```
+
+En el Sistema de Triage usamos proxy inverso en tres situaciones:
+
+| Situación | Quién hace el proxy | Cómo se configura |
+|---|---|---|
+| Docker Compose local | Nginx | `proxy_pass http://triage-backend:8080` en `nginx.conf` |
+| Frontend en Vercel | Servidor de Vercel | Bloque `rewrites` en `vercel.json` |
+| Frontend en Render | CDN de Render | Bloque `routes` en `render.yaml` |
+
+#### Por qué el proxy inverso resuelve CORS
+
+CORS (Cross-Origin Resource Sharing) es una restricción del *navegador* — no del servidor. El navegador bloquea una petición cuando el **origen de la página** es diferente al **origen del API**.
+
+El origen se compone de: `protocolo + dominio + puerto`.
+
+```
+SIN PROXY:
+  Página:    https://triage.vercel.app        → origen A
+  Petición:  https://triage-api.railway.app   → origen B  ← DIFERENTE
+  Resultado: ❌ CORS error — el navegador bloquea la respuesta
+
+CON PROXY (Vercel rewrites en vercel.json):
+  Página:    https://triage.vercel.app        → origen A
+  Petición:  https://triage.vercel.app/api    → origen A  ← MISMO
+  (Vercel redirige /api/* a Railway internamente, server-side)
+  Resultado: ✅ El navegador no ve el cambio — todo es el mismo origen
+```
+
+La clave es que **la redirección ocurre en el servidor**, no en el navegador. El navegador hace una petición a `triage.vercel.app/api` (mismo origen), Vercel la intercepta y la reenvía a Railway, y le devuelve la respuesta al navegador. El navegador nunca supo que existió Railway.
+
+Ahora que entendés el concepto, la configuración de Nginx que viene a continuación tiene mucho más sentido:
+
+---
 
 ### El archivo `nginx.conf`
 
@@ -1645,27 +1858,622 @@ jobs:
           railway status --service triage-backend
 
   # ──────────────────────────────────────────────────────────
-  # JOB 3: Notificación del resultado
+  # JOB 3: Desplegar Frontend en Vercel
+  # Corre EN PARALELO con deploy-to-railway: ambos dependen solo
+  # de build-and-push, así que Railway y Vercel se despliegan
+  # al mismo tiempo y el CD total tarda lo que dure el más lento.
+  # ──────────────────────────────────────────────────────────
+  deploy-frontend:
+    name: Deploy Frontend a Vercel
+    runs-on: ubuntu-latest
+    needs: build-and-push    # Depende de build-and-push, NO de deploy-to-railway
+    environment: production
+
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+
+      - name: Configurar Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: triage-frontend/package-lock.json
+
+      - name: Instalar dependencias
+        working-directory: ./triage-frontend
+        run: npm ci --frozen-lockfile
+
+      - name: Build de producción
+        working-directory: ./triage-frontend
+        run: npx ng build --configuration production
+
+      # Verificar que el build generó index.html antes de invocar Vercel
+      - name: Verificar output del build
+        run: |
+          if [ ! -f triage-frontend/dist/triage-frontend/browser/index.html ]; then
+            echo "❌ index.html no encontrado en el output del build"
+            exit 1
+          fi
+          echo "✅ Build verificado: index.html existe"
+          ls -la triage-frontend/dist/triage-frontend/browser/
+
+      # Desplegar en Vercel usando la action oficial de la comunidad
+      # --prod garantiza que va a producción y no a una preview URL
+      - name: Deploy a Vercel (producción)
+        uses: amondnet/vercel-action@v25
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID }}
+          working-directory: ./triage-frontend
+          vercel-args: '--prod'
+
+  # ──────────────────────────────────────────────────────────
+  # JOB 4: Notificación del resultado
+  # Se ejecuta cuando AMBOS despliegues terminan (exitosos o no)
   # ──────────────────────────────────────────────────────────
   notify:
     name: Notificar Resultado
     runs-on: ubuntu-latest
-    needs: [build-and-push, deploy-to-railway]
+    needs: [deploy-to-railway, deploy-frontend]    # Espera a AMBOS despliegues
     if: always()    # Ejecutar aunque los jobs anteriores fallen
 
     steps:
-      - name: Notificación de éxito
-        if: needs.deploy-to-railway.result == 'success'
+      # Escribir un resumen en la pestaña "Summary" de GitHub Actions
+      - name: Resumen del despliegue
         run: |
-          echo "✅ Despliegue exitoso a producción"
-          echo "Backend: https://triage-api.railway.app"
+          echo "## Resultado del Despliegue a Producción" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Servicio | Estado |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Backend (Railway) | ${{ needs.deploy-to-railway.result == 'success' && '✅ Éxito' || '❌ Falló' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Frontend (Vercel) | ${{ needs.deploy-frontend.result == 'success' && '✅ Éxito' || '❌ Falló' }} |" >> $GITHUB_STEP_SUMMARY
 
-      - name: Notificación de fallo
-        if: needs.deploy-to-railway.result == 'failure'
+      - name: Notificación de éxito total
+        if: needs.deploy-to-railway.result == 'success' && needs.deploy-frontend.result == 'success'
         run: |
-          echo "❌ El despliegue falló. Revisar los logs."
+          echo "✅ Despliegue completo exitoso"
+          echo "🚀 Backend:  https://triage-api.railway.app"
+          echo "🌐 Frontend: https://triage.vercel.app"
+
+      - name: Notificación de fallo parcial o total
+        if: needs.deploy-to-railway.result == 'failure' || needs.deploy-frontend.result == 'failure'
+        run: |
+          echo "❌ Uno o más despliegues fallaron. Revisar los logs."
+          echo "Backend (Railway): ${{ needs.deploy-to-railway.result }}"
+          echo "Frontend (Vercel): ${{ needs.deploy-frontend.result }}"
           exit 1
 ```
+
+### Flujo visual del CD completo
+
+Una vez integrado el `deploy-frontend`, el pipeline tiene cuatro jobs. Los jobs 2 y 3 corren **en paralelo** porque ambos dependen únicamente del job 1:
+
+```
+  git push → rama main
+        │
+        ▼
+┌─────────────────────────────────┐
+│  JOB 1: build-and-push          │
+│  Build + Push Docker images     │
+│  a Docker Hub                   │
+└──────────────┬──────────────────┘
+               │
+       ┌───────┴────────┐
+       ▼                ▼
+┌─────────────┐   ┌──────────────────┐
+│   JOB 2     │   │     JOB 3        │
+│  Railway    │   │     Vercel       │
+│  (Backend)  │   │   (Frontend)     │
+│  railway up │   │  vercel-action   │
+└──────┬──────┘   └───────┬──────────┘
+       │                  │
+       └──────────┬────────┘
+                  ▼
+        ┌──────────────────┐
+        │     JOB 4        │
+        │     notify       │
+        │  Resumen en      │
+        │  GitHub Summary  │
+        └──────────────────┘
+```
+
+> **¿Por qué en paralelo?** Si `deploy-frontend` dependiera de `deploy-to-railway`, el frontend esperaría ~30 s extra cada vez que se despliega, sin ningún beneficio. Al hacerlos independientes, el tiempo total del CD es `max(tiempo_railway, tiempo_vercel)` en lugar de la suma.
+
+---
+
+### Secrets necesarios en GitHub
+
+Para que el pipeline completo funcione, necesitas configurar **6 secrets** en tu repositorio (Settings → Secrets and variables → Actions → New repository secret):
+
+| Secret | Descripción | Cómo obtenerlo |
+|---|---|---|
+| `DOCKER_HUB_USERNAME` | Tu nombre de usuario en Docker Hub | Aparece en la esquina superior derecha de hub.docker.com |
+| `DOCKER_HUB_TOKEN` | Token de acceso a Docker Hub (no tu contraseña) | hub.docker.com → Account Settings → Security → New Access Token (permisos: Read, Write, Delete) |
+| `RAILWAY_TOKEN` | Token para que GitHub Actions pueda desplegar en Railway | railway.app/account/tokens → Create Token → nombre: `github-actions-triage` |
+| `VERCEL_TOKEN` | Token de autenticación para la CLI de Vercel | vercel.com/account/tokens → Create Token → nombre: `github-actions-triage` |
+| `VERCEL_ORG_ID` | ID de tu organización o cuenta personal en Vercel | Ver subsección siguiente |
+| `VERCEL_PROJECT_ID` | ID del proyecto de triage-frontend en Vercel | Ver subsección siguiente |
+
+> **¿Por qué tokens y no contraseñas?** Los tokens tienen alcance limitado (solo las operaciones que necesitas) y se pueden revocar individualmente sin cambiar tu contraseña. Si un token se filtra accidentalmente en los logs, el daño está controlado.
+
+---
+
+### Cómo obtener el VERCEL_ORG_ID y VERCEL_PROJECT_ID
+
+Vercel asigna estos IDs automáticamente cuando vinculás tu proyecto local con el proyecto en la nube. El proceso toma menos de dos minutos:
+
+```bash
+# Paso 1: Instalar la CLI de Vercel globalmente
+npm install -g vercel
+
+# Paso 2: Desde la carpeta del frontend, vincular con el proyecto en Vercel
+cd triage-frontend
+vercel link
+
+# Vercel te va a preguntar:
+# ✔ Set up "~/triage-frontend"? (y)
+# ✔ Which scope do you want to deploy to? → tu usuario o equipo
+# ✔ Found project "triage-frontend". Link to it? (y)
+# Si no existe, te preguntará si querés crear un proyecto nuevo.
+
+# Paso 3: Leer los valores del archivo generado
+cat .vercel/project.json
+```
+
+El archivo `.vercel/project.json` tiene este formato:
+
+```json
+{
+  "orgId": "team_AbCdEfGhIjKlMnOpQrStUvWx",
+  "projectId": "prj_1a2B3c4D5e6F7g8H9i0JkLmN"
+}
+```
+
+- El valor de `orgId` → va como secret `VERCEL_ORG_ID`
+- El valor de `projectId` → va como secret `VERCEL_PROJECT_ID`
+
+> **Importante:** Agrega `.vercel/` a tu `.gitignore` para no subir estos IDs al repositorio. Aunque no son secretos críticos (no permiten autenticarse solos), es buena práctica no exponerlos.
+
+```bash
+# Agregar a .gitignore
+.vercel/
+```
+
+## 11.5 GitHub Container Registry (GHCR): Guardar Imágenes en GitHub
+
+Docker Hub es el registry más conocido, pero tiene una limitación importante: es una cuenta y un servicio separados de GitHub. **GHCR (GitHub Container Registry)** es el registry de imágenes integrado directamente en GitHub — las imágenes viven en el mismo lugar que el código.
+
+### ¿Por qué GHCR en lugar de Docker Hub?
+
+| Característica | Docker Hub | GHCR |
+|---|---|---|
+| **Autenticación** | Token separado (`DOCKER_HUB_TOKEN`) | `GITHUB_TOKEN` automático |
+| **Secrets adicionales** | 2 (`DOCKER_HUB_USERNAME` + `DOCKER_HUB_TOKEN`) | 0 para repos propios |
+| **URL de la imagen** | `usuario/imagen:tag` | `ghcr.io/usuario/repo/imagen:tag` |
+| **Visibilidad** | Pública por defecto | Sigue la visibilidad del repo |
+| **Pulls gratuitos** | 100/hora sin auth (anónimo) | Ilimitados para repos públicos |
+| **Integración con GitHub** | Manual (link externo) | Nativa (aparece en el repo) |
+| **Ideal para** | Distribución pública amplia | Proyectos en GitHub (incluye proyectos estudiantiles) |
+
+> **Ventaja para estudiantes:** Con GHCR tenés todo en un solo lugar. No necesitás crear cuenta en Docker Hub, configurar un token adicional, ni salir de GitHub. El token `GITHUB_TOKEN` es generado automáticamente por GitHub Actions en cada ejecución — vos no lo creás ni lo gestionás.
+
+### Autenticarse en GHCR desde GitHub Actions
+
+```yaml
+# El login en GHCR usa el GITHUB_TOKEN automático
+# No necesitás configurar ningún secret adicional para esto
+- name: Login en GitHub Container Registry
+  uses: docker/login-action@v3
+  with:
+    registry: ghcr.io
+    username: ${{ github.actor }}       # tu nombre de usuario de GitHub
+    password: ${{ secrets.GITHUB_TOKEN }}  # generado automáticamente por Actions
+```
+
+`GITHUB_TOKEN` es un token temporal que GitHub Actions genera al inicio de cada ejecución con permisos para acceder al repositorio y a GHCR. Expira cuando termina el workflow.
+
+### El nombre de la imagen en GHCR
+
+Las imágenes en GHCR siguen este patrón:
+
+```
+ghcr.io/USUARIO/NOMBRE-REPO/NOMBRE-SERVICIO:TAG
+
+Ejemplo:
+ghcr.io/josealfredore2604/triage-sistema/triage-backend:latest
+ghcr.io/josealfredore2604/triage-sistema/triage-frontend:main-sha-a1b2c3d
+```
+
+### El `cd.yml` completo usando GHCR
+
+Este workflow reemplaza Docker Hub por GHCR. Observá que los jobs `deploy-to-railway` y `deploy-frontend` son idénticos al cd.yml anterior — solo cambia el job `build-and-push`:
+
+```yaml
+# .github/workflows/cd-ghcr.yml
+# Versión que usa GHCR en lugar de Docker Hub
+# Ventaja: sin DOCKER_HUB_USERNAME ni DOCKER_HUB_TOKEN
+
+name: CD — Despliegue Continuo (GHCR)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Permiso para escribir en GHCR (necesario para hacer push de imágenes)
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+jobs:
+
+  build-and-push:
+    name: Build y Push Docker Images → GHCR
+    runs-on: ubuntu-latest
+
+    outputs:
+      image-tag: ${{ steps.meta-backend.outputs.version }}
+
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+
+      - name: Configurar QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Configurar Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Login en GHCR — usa GITHUB_TOKEN automático, sin secrets adicionales
+      - name: Login en GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # El nombre de la imagen incluye ghcr.io y la ruta del repo
+      - name: Generar metadata (backend)
+        id: meta-backend
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}/triage-backend
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix={{branch}}-sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Generar metadata (frontend)
+        id: meta-frontend
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}/triage-frontend
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix={{branch}}-sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build y Push — triage-backend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./triage-backend
+          dockerfile: ./triage-backend/Dockerfile
+          push: true
+          tags: ${{ steps.meta-backend.outputs.tags }}
+          labels: ${{ steps.meta-backend.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
+
+      - name: Build y Push — triage-frontend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./triage-frontend
+          dockerfile: ./triage-frontend/Dockerfile
+          push: true
+          tags: ${{ steps.meta-frontend.outputs.tags }}
+          labels: ${{ steps.meta-frontend.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
+
+  # Los jobs deploy-to-railway y deploy-frontend son idénticos
+  # al cd.yml principal — solo cambia el registry de las imágenes
+  deploy-to-railway:
+    name: Deploy a Railway
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    environment: production
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+      - name: Instalar Railway CLI
+        run: curl -fsSL https://railway.app/install.sh | sh
+      - name: Deploy backend en Railway
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: railway up --service triage-backend --detach
+      - name: Verificar deploy
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: |
+          sleep 30
+          railway status --service triage-backend
+
+  deploy-frontend:
+    name: Deploy Frontend a Vercel
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    environment: production
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+      - name: Configurar Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: triage-frontend/package-lock.json
+      - name: Instalar dependencias
+        working-directory: ./triage-frontend
+        run: npm ci --frozen-lockfile
+      - name: Build de producción
+        working-directory: ./triage-frontend
+        run: npx ng build --configuration production
+      - name: Deploy a Vercel (producción)
+        uses: amondnet/vercel-action@v25
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID }}
+          working-directory: ./triage-frontend
+          vercel-args: '--prod'
+
+  notify:
+    name: Notificar Resultado
+    runs-on: ubuntu-latest
+    needs: [deploy-to-railway, deploy-frontend]
+    if: always()
+    steps:
+      - name: Resumen del despliegue
+        run: |
+          echo "## Resultado del Despliegue (GHCR)" >> $GITHUB_STEP_SUMMARY
+          echo "| Servicio | Estado |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Backend (Railway) | ${{ needs.deploy-to-railway.result == 'success' && '✅ Éxito' || '❌ Falló' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Frontend (Vercel) | ${{ needs.deploy-frontend.result == 'success' && '✅ Éxito' || '❌ Falló' }} |" >> $GITHUB_STEP_SUMMARY
+```
+
+### Secrets necesarios con GHCR (comparación)
+
+Con GHCR eliminás dos de los seis secrets:
+
+| Secret | Docker Hub | GHCR |
+|---|---|---|
+| `DOCKER_HUB_USERNAME` | ✅ Necesario | ❌ No necesario |
+| `DOCKER_HUB_TOKEN` | ✅ Necesario | ❌ No necesario |
+| `RAILWAY_TOKEN` | ✅ Necesario | ✅ Necesario |
+| `VERCEL_TOKEN` | ✅ Necesario | ✅ Necesario |
+| `VERCEL_ORG_ID` | ✅ Necesario | ✅ Necesario |
+| `VERCEL_PROJECT_ID` | ✅ Necesario | ✅ Necesario |
+| `GITHUB_TOKEN` | ❌ No necesario | ✅ Automático |
+
+### Cómo ver las imágenes en GitHub
+
+Después del primer push exitoso, las imágenes aparecen en la sección **Packages** de tu repositorio:
+
+```
+Tu repositorio en GitHub
+└── Pestaña "Code" (vista principal)
+    └── Barra lateral derecha → "Packages"
+        ├── triage-backend
+        └── triage-frontend
+```
+
+Desde ahí podés ver los tags disponibles, la fecha de cada push y el comando para hacer `docker pull` de la imagen.
+
+---
+
+## 11.6 CI/CD con Gradle Wrapper: Diferencias con Maven
+
+### Por qué el Gradle Wrapper es fundamental para CI/CD
+
+Cuando ejecutás un pipeline de CI en un servidor (GitHub Actions usa Ubuntu), ese servidor no tiene Gradle instalado globalmente. **El Gradle Wrapper resuelve esto**: en lugar de depender de que el servidor tenga la versión correcta de Gradle, tu repositorio incluye un pequeño script (`gradlew`) que descarga y ejecuta exactamente la versión de Gradle que el proyecto necesita.
+
+```
+SIN WRAPPER:
+  Servidor CI (Ubuntu) → ¿Tenés Gradle 8.5? → No → ❌ Build falla
+
+CON WRAPPER:
+  Servidor CI (Ubuntu) → ./gradlew → descarga Gradle 8.5 → ✅ Build funciona
+  (la versión está especificada en gradle-wrapper.properties)
+```
+
+### Los archivos del wrapper que DEBEN estar en Git
+
+```
+triage-backend/
+├── gradlew              ← Script shell para Linux/Mac — DEBE estar en Git
+├── gradlew.bat          ← Script batch para Windows — DEBE estar en Git
+└── gradle/
+    └── wrapper/
+        ├── gradle-wrapper.jar        ← El launcher — DEBE estar en Git (es un binario)
+        └── gradle-wrapper.properties ← Versión de Gradle — DEBE estar en Git
+```
+
+El `gradle-wrapper.jar` es el único binario que tiene justificado estar en Git. Sin él, `./gradlew` no puede descargarse a sí mismo en un servidor sin Gradle preinstalado — es el bootstrapper.
+
+El `gradle-wrapper.properties` especifica qué versión descargar:
+
+```properties
+# gradle/wrapper/gradle-wrapper.properties
+distributionBase=GRADLE_USER_HOME
+distributionPath=wrapper/dists
+distributionUrl=https\://services.gradle.org/distributions/gradle-8.11-bin.zip
+networkTimeout=10000
+validateDistributionUrl=true
+zipStoreBase=GRADLE_USER_HOME
+zipStorePath=wrapper/dists
+```
+
+> **Nunca agregues `gradle/wrapper/` al `.gitignore`**. Es un error común tratar el `gradle-wrapper.jar` como un binario que no debe estar en Git, pero sin él tu pipeline de CI no puede funcionar.
+
+### Caché de Gradle en GitHub Actions
+
+El caché de Gradle funciona diferente al de Maven. Configuralo así en tus workflows:
+
+```yaml
+# Para Maven:
+- name: Configurar Java 21
+  uses: actions/setup-java@v4
+  with:
+    java-version: '21'
+    distribution: 'temurin'
+    cache: 'maven'    # Cachea ~/.m2/repository
+
+# Para Gradle:
+- name: Configurar Java 21
+  uses: actions/setup-java@v4
+  with:
+    java-version: '21'
+    distribution: 'temurin'
+    cache: 'gradle'   # Cachea ~/.gradle/caches y ~/.gradle/wrapper
+```
+
+Con `cache: 'gradle'`, GitHub Actions guarda tanto las dependencias descargadas como el propio Gradle, así que el segundo build es significativamente más rápido.
+
+### Tabla comparativa de comandos CI/CD Maven vs Gradle
+
+| Operación | Maven | Gradle |
+|---|---|---|
+| Compilar | `./mvnw compile` | `./gradlew compileJava` |
+| Ejecutar tests | `./mvnw test -B` | `./gradlew test --no-daemon` |
+| Build JAR | `./mvnw package -DskipTests -B` | `./gradlew bootJar -x test --no-daemon` |
+| Ubicación del JAR | `target/*.jar` | `build/libs/*-[0-9]*.jar` |
+| Wrapper file | `mvnw` | `gradlew` |
+| Archivo de config | `pom.xml` | `build.gradle` |
+| Directorio de caché | `~/.m2` | `~/.gradle` |
+| Cache en setup-java | `cache: 'maven'` | `cache: 'gradle'` |
+| Permiso en CI | `chmod +x mvnw` | `chmod +x gradlew` |
+| Reportes de tests | `target/surefire-reports/*.xml` | `build/test-results/test/*.xml` |
+
+### El `ci.yml` completo para un proyecto Gradle
+
+Este workflow es el equivalente Gradle del `ci.yml` de Maven que ya viste en la sección 11:
+
+```yaml
+# .github/workflows/ci-gradle.yml
+# CI para proyectos Spring Boot con Gradle
+
+name: CI — Integración Continua (Gradle)
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+
+  test-backend:
+    name: Tests Backend (Java 21 + Gradle)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: triage_test
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_pass
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+
+      - name: Configurar Java 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: 'gradle'    # Cachea ~/.gradle/caches (no ~/.m2)
+
+      # En Linux, gradlew puede no tener permisos de ejecución
+      # si el repo fue creado en Windows (ver sección de troubleshooting)
+      - name: Dar permisos de ejecución al Gradle Wrapper
+        working-directory: ./triage-backend
+        run: chmod +x gradlew
+
+      - name: Ejecutar tests del backend
+        working-directory: ./triage-backend
+        env:
+          DATABASE_URL: jdbc:postgresql://localhost:5432/triage_test
+          DATABASE_USERNAME: test_user
+          DATABASE_PASSWORD: test_pass
+          JWT_SECRET: test-secret-key-para-ci-minimo-64-caracteres-de-largo-ok
+          SPRING_PROFILES_ACTIVE: test
+        # --no-daemon: el daemon de Gradle tiene estado persistente en disco
+        # En CI (entorno efímero) el daemon no aporta nada y consume memoria extra
+        run: ./gradlew test --no-daemon
+
+      # Los reportes de Gradle están en build/test-results/ (no en target/surefire-reports/)
+      - name: Publicar reporte de tests
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: Tests Backend (Gradle)
+          path: triage-backend/build/test-results/test/*.xml
+          reporter: java-junit
+
+  build-frontend:
+    name: Build Frontend (Angular 19 + Node 22)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+      - name: Configurar Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: triage-frontend/package-lock.json
+      - name: Instalar dependencias
+        working-directory: ./triage-frontend
+        run: npm ci --frozen-lockfile
+      - name: Build de producción
+        working-directory: ./triage-frontend
+        run: npx ng build --configuration production
+      - name: Verificar output del build
+        run: ls -la triage-frontend/dist/triage-frontend/browser/
+```
+
+### El problema de permisos de `gradlew` en Windows
+
+Si creaste el repositorio en Windows, es muy probable que `gradlew` no tenga el bit de ejecución cuando el servidor de CI (Linux) lo intente correr. El síntoma es un error como `Permission denied: ./gradlew`.
+
+La solución permanente es ejecutar esto una sola vez desde tu máquina y hacer commit:
+
+```bash
+# Desde la raíz del proyecto backend
+git update-index --chmod=+x gradlew
+git commit -m "fix: dar permisos de ejecución al Gradle Wrapper"
+git push
+```
+
+A diferencia del `chmod +x gradlew` que se hace en el workflow (que funciona pero es un parche en cada build), este comando persiste el permiso en Git. Es la solución correcta.
 
 ---
 
@@ -1750,6 +2558,629 @@ curl -X POST https://triage-backend-production.up.railway.app/api/v1/auth/login 
 # {"token":"eyJhbGci...","type":"Bearer","expiresIn":3600000}
 ```
 
+## 12.5 Render: Alternativa Gratuita a Railway
+
+Render es otra plataforma de despliegue en la nube, con un tier gratuito permanente que no requiere tarjeta de crédito. Es una buena alternativa cuando preferís no registrarte en Railway o cuando tu institución tiene restricciones con ciertos servicios.
+
+### ¿Cuándo elegir Render sobre Railway?
+
+| Característica | Railway | Render |
+|---|---|---|
+| **Tier gratuito** | $5 crédito/mes (se agota) | Permanente (con limitaciones) |
+| **Sleep en inactividad** | No (con crédito activo) | Sí — 15 min sin requests |
+| **PostgreSQL gratuito** | ✅ Sí | ✅ Sí (90 días, luego de pago) |
+| **Deploy desde Docker Hub** | ✅ Sí | ✅ Sí |
+| **Deploy desde GHCR** | ✅ Sí | ✅ Sí |
+| **Deploy directo desde GitHub** | ✅ Sí | ✅ Sí |
+| **Variables de entorno** | UI + Railway CLI | UI + Render CLI |
+| **Dominio custom gratuito** | ✅ Sí | ✅ Sí |
+| **Facilidad de uso** | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐ |
+| **Velocidad de primer deploy** | ~2 min | ~3-5 min |
+
+> **La limitación más importante de Render en tier gratuito:** El servicio se "duerme" después de 15 minutos sin recibir peticiones HTTP. Cuando alguien accede después de ese período, Render despierta el contenedor — esto tarda entre 20 y 60 segundos durante los cuales la petición queda esperando. Para un sistema académico que se usa en horarios de clase, esto es aceptable. Para un sistema de producción real, necesitarías el tier de pago (desde $7/mes) para desactivar el sleep.
+
+### Paso a paso: crear el servicio en Render
+
+1. Ve a [https://render.com](https://render.com) y creá una cuenta con GitHub
+2. Desde el dashboard, hacé clic en **"New +"** → **"Web Service"**
+3. Elegí **"Connect a repository"** (para deploy desde GitHub) o **"Deploy an existing image"** (para Docker Hub/GHCR)
+4. Configurá el servicio con estos valores:
+
+```
+Name:          triage-backend
+Region:        Oregon (US West) o Frankfurt (EU) — el más cercano
+Branch:        main
+Runtime:       Docker
+Build Command: (vacío — Render usa el Dockerfile)
+Start Command: (vacío — Render usa el ENTRYPOINT del Dockerfile)
+```
+
+5. En la sección **"Environment Variables"**, agregá todas las variables necesarias (las mismas que en Railway)
+6. Hacé clic en **"Create Web Service"**
+
+### Build Command y Start Command según el build tool
+
+Si Render detecta que no hay Dockerfile y construye desde el código fuente, usá estos comandos:
+
+**Con Maven:**
+```bash
+# Build Command
+./mvnw package -DskipTests
+
+# Start Command
+java -jar target/*.jar
+```
+
+**Con Gradle:**
+```bash
+# Build Command
+./gradlew bootJar -x test --no-daemon
+
+# Start Command
+java -jar build/libs/*-[0-9]*.jar
+```
+
+### Despliegue automático desde Docker Hub o GHCR
+
+Si preferís desplegar desde una imagen Docker en lugar de compilar en Render:
+
+1. En **"New +"** → **"Web Service"** → **"Deploy an existing image"**
+2. Ingresá la URL de la imagen: `tu-usuario/triage-backend:latest` (Docker Hub) o `ghcr.io/tu-usuario/triage/triage-backend:latest` (GHCR)
+3. Para imágenes privadas en GHCR, necesitás configurar las credenciales en Render
+
+**Para actualizar automáticamente** cuando una nueva imagen esté disponible, usá el **Deploy Hook** de Render:
+
+1. En tu servicio de Render → **Settings** → **Deploy Hook** → copiá la URL
+2. Guardala como secret en GitHub: `RENDER_DEPLOY_HOOK_URL`
+3. Agregá este paso al final del job `build-and-push` en tu `cd.yml`:
+
+```yaml
+      # Después de hacer push de la nueva imagen, triggerear el redeploy en Render
+      - name: Triggerear redeploy en Render
+        run: curl -X POST "${{ secrets.RENDER_DEPLOY_HOOK_URL }}"
+```
+
+Cuando Render recibe esta petición, descarga la nueva imagen y reinicia el servicio automáticamente.
+
+### Render y la base de datos: opciones
+
+Render ofrece PostgreSQL gestionado en tier gratuito (por 90 días), pero **no ofrece MariaDB ni MySQL**. Si tu proyecto usa MySQL/MariaDB, tenés dos opciones:
+
+**Opción A — Migrar a PostgreSQL (recomendada):**
+
+```yaml
+# application-prod.properties (o yml)
+# Cambiar el driver de MySQL a PostgreSQL:
+spring.datasource.url=${DATABASE_URL}
+spring.datasource.driver-class-name=org.postgresql.Driver
+
+# En build.gradle, reemplazar la dependencia de MySQL:
+# implementation 'com.mysql:mysql-connector-j'  ← quitar esto
+# implementation 'org.postgresql:postgresql'      ← agregar esto
+```
+
+**Opción B — BD externa + Render para la app:**
+
+```bash
+# Usar Railway SOLO para la base de datos (es gratuito para PostgreSQL)
+# Y Render para la aplicación Spring Boot
+
+# Variables en Render apuntando a la BD de Railway:
+DATABASE_URL=jdbc:postgresql://<host-railway>:<port>/<db>
+DATABASE_USERNAME=postgres
+DATABASE_PASSWORD=<password-de-railway>
+```
+
+### Secrets necesarios para Render en GitHub Actions
+
+| Secret | Descripción |
+|---|---|
+| `RENDER_DEPLOY_HOOK_URL` | URL de deploy hook de Render (Settings del servicio) |
+| `RAILWAY_TOKEN` | Solo si Railway sigue siendo el proveedor de la BD |
+| `VERCEL_TOKEN` / `VERCEL_ORG_ID` / `VERCEL_PROJECT_ID` | Para el frontend en Vercel (sin cambios) |
+
+---
+
+### 12.5.1 Render Static Sites: Desplegar el Frontend Angular
+
+Hasta acá viste cómo usar Render para el **backend** (Web Service). Pero Render también tiene un tipo de servicio completamente diferente llamado **Static Site**, pensado exactamente para lo que genera `ng build`: archivos HTML, CSS y JavaScript estáticos.
+
+| Característica | Render Web Service | Render Static Site |
+|---|---|---|
+| **Ideal para** | APIs, backends, servidores | SPAs, Angular, React, sitios estáticos |
+| **Sleep en inactividad** | Sí (15 min en tier gratuito) | **No** — CDN, siempre disponible |
+| **Precio** | Gratis (con sleep) / $7/mes | **Gratis permanente** |
+| **Tiempo de deploy** | ~3-5 min | ~1-2 min |
+| **Proxy server-side** | Sí (podés hacer rewrites) | No — solo archivos estáticos |
+| **Variables de entorno en runtime** | Sí | No — se hornean en el build |
+
+> **La ventaja más importante:** los Static Sites de Render no tienen sleep. Tu Angular va a responder instantáneamente siempre, sin importar cuánto tiempo haya pasado desde el último acceso.
+
+#### Paso a paso: crear el Static Site en Render
+
+1. Dashboard → **"New +"** → **"Static Site"**
+2. Conectá tu repositorio de GitHub
+3. Configurá los campos:
+
+```
+Name:              triage-frontend
+Branch:            main
+Root Directory:    triage-frontend/    ← si es un monorepo; vacío si es repo separado
+Build Command:     npm ci && npx ng build --configuration production
+Publish Directory: dist/triage-frontend/browser
+```
+
+4. En **"Environment Variables"** no necesitás agregar la URL del API — eso va directamente en `environment.prod.ts` (Angular no tiene acceso a variables de entorno en runtime como un servidor; los valores se "hornean" durante el `ng build`)
+5. Clic en **"Save"** → **"Create Static Site"**
+
+#### El problema del routing en Angular SPA con Render Static Sites
+
+Cuando el usuario navega directamente a `https://triage-frontend.onrender.com/solicitudes/47` en el navegador (o recarga la página con F5 en esa ruta), Render busca el archivo `solicitudes/47/index.html`... que no existe. Angular maneja el routing del lado del cliente (cuando JavaScript ya está cargado), pero el servidor no lo sabe.
+
+La solución es un archivo `_redirects` que le dice a Render: "para cualquier ruta que no encuentres, servíle `index.html` con código 200":
+
+```
+# src/_redirects
+# Redirigir todas las rutas al index.html para que Angular maneje el routing
+# El código 200 (no 301) hace que el navegador no cambie la URL
+/*    /index.html    200
+```
+
+Para que Angular incluya este archivo en el output del build, configurá `angular.json`:
+
+```json
+{
+  "projects": {
+    "triage-frontend": {
+      "architect": {
+        "build": {
+          "options": {
+            "assets": [
+              "src/favicon.ico",
+              "src/assets",
+              {
+                "glob": "_redirects",
+                "input": "src",
+                "output": "/"
+              }
+            ]
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Con esto, `src/_redirects` se copia a `dist/triage-frontend/browser/_redirects` durante cada `ng build`. Render lo detecta automáticamente.
+
+#### El `environment.prod.ts` para Angular en Render
+
+Cuando el backend está en Render (y no hay proxy server-side como en Vercel), la URL del API **debe ser absoluta**. Render Static Sites no hace rewrites de peticiones — solo sirve archivos:
+
+```typescript
+// src/environments/environment.prod.ts
+// Para el escenario: frontend en Render Static Site + backend en Render Web Service
+
+export const environment = {
+  production: true,
+
+  // URL absoluta del backend en Render (no relativa como con Vercel)
+  // Render asigna un subdominio .onrender.com al crear el servicio
+  // ⚠️  Reemplazá 'triage-backend' con el nombre REAL que le diste a tu servicio
+  apiUrl: 'https://triage-backend.onrender.com/api/v1',
+
+  appName: 'Sistema de Triage Académico - UniQuindío'
+};
+```
+
+> **¿Por qué absoluta y no relativa?** Con Vercel, las peticiones a `/api/v1/*` son interceptadas por los rewrites server-side antes de llegar al navegador — el navegador nunca ve el dominio del backend. Con Render Static Sites, no hay servidor intermediario: el navegador descarga los archivos estáticos y luego hace peticiones HTTP directamente. Si usaras `/api/v1`, el navegador buscaría `https://triage-frontend.onrender.com/api/v1` que no existe. La URL debe ser la real del backend.
+
+#### CORS en Spring Boot cuando el frontend está en Render
+
+Como el frontend y el backend están en dominios diferentes (`.onrender.com` pero con subdominios distintos), el navegador aplica CORS. Necesitás configurarlo en Spring Boot:
+
+```java
+// src/main/java/co/edu/uniquindio/triage/config/CorsConfig.java
+@Configuration
+public class CorsConfig implements WebMvcConfigurer {
+
+    // Inyectar la URL del frontend desde variable de entorno
+    // Así no hardcodeás el dominio en el código fuente
+    @Value("${FRONTEND_URL:http://localhost:4200}")
+    private String frontendUrl;
+
+    @Override
+    public void addCorsMappings(CorsRegistry registry) {
+        registry.addMapping("/api/**")
+            // allowedOrigins acepta múltiples valores separados por coma
+            // El frontendUrl viene de la variable de entorno del backend en Render
+            .allowedOrigins(frontendUrl, "http://localhost:4200")
+            .allowedMethods("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
+            .allowedHeaders("*")
+            .allowCredentials(true)
+            .maxAge(3600);
+    }
+}
+```
+
+En las **variables de entorno del backend** en el dashboard de Render:
+
+```bash
+FRONTEND_URL=https://triage-frontend.onrender.com
+# ⚠️  Reemplazá con el subdominio real de tu Static Site
+```
+
+> **Importante:** `allowCredentials(true)` es necesario si tu frontend envía el header `Authorization` (JWT) en las peticiones. Si está en `true`, `allowedOrigins` no puede ser `"*"` — debe ser el dominio exacto.
+
+---
+
+### 12.5.2 El Escenario Completo: Todo en Render
+
+Cuando ponés backend, frontend y base de datos en Render, tenés la pila completa en un solo dashboard. Es la opción más simple para proyectos estudiantiles que no quieren gestionar múltiples cuentas.
+
+```
+┌────────────────────────────────────────────────────────┐
+│              RENDER — un solo dashboard                │
+│                                                        │
+│  ┌──────────────────────────────────────────────────┐  │
+│  │  Static Site (gratuito permanente, sin sleep)    │  │
+│  │  triage-frontend.onrender.com                   │  │
+│  │  Angular → archivos en CDN global               │  │
+│  └──────────────────┬───────────────────────────────┘  │
+│                     │ HTTPS (URL absoluta con CORS)    │
+│                     ▼                                  │
+│  ┌──────────────────────────────────────────────────┐  │
+│  │  Web Service (gratis con sleep / $7/mes sin)     │  │
+│  │  triage-backend.onrender.com                    │  │
+│  │  Spring Boot (Maven o Gradle) — Dockerfile       │  │
+│  └──────────────────┬───────────────────────────────┘  │
+│                     │ JDBC interno                     │
+│                     ▼                                  │
+│  ┌──────────────────────────────────────────────────┐  │
+│  │  PostgreSQL (gratuito 90 días)                   │  │
+│  │  Gestionado por Render — sin configuración       │  │
+│  └──────────────────────────────────────────────────┘  │
+└────────────────────────────────────────────────────────┘
+
+  Flujo de un request del estudiante al sistema:
+  Navegador → CDN Render (frontend) → HTTPS → Backend Render → PostgreSQL Render
+```
+
+**Ventajas:**
+- Un solo dashboard para gestionar todo
+- No necesitás cuenta en Railway, Docker Hub, ni Vercel
+- El Static Site es 100% gratuito y sin sleep — la UI siempre responde
+- Deploy automático en cada `git push` a main (sin GitHub Actions si preferís)
+- La BD se conecta automáticamente al backend sin hardcodear credenciales
+
+**Limitaciones:**
+- El backend en tier gratuito tiene sleep de 15 min — la primera petición después de inactividad tarda ~30-60 s
+- PostgreSQL gratuito expira a los 90 días (después es $7/mes)
+- No generás imágenes Docker reutilizables
+
+---
+
+### 12.5.3 El `render.yaml`: Infrastructure as Code en Render
+
+En lugar de configurar cada servicio manualmente desde la UI de Render, podés definirlos todos en un archivo `render.yaml` en la raíz del repositorio. Esto es lo que se llama **Infrastructure as Code (IaC)**: la infraestructura queda versionada junto al código.
+
+Cuando Render detecta este archivo, crea todos los servicios automáticamente al conectar el repositorio (desde Dashboard → New → Blueprint).
+
+```yaml
+# render.yaml
+# Colocá este archivo en la raíz del repositorio (monorepo)
+# Define: backend Web Service + frontend Static Site + PostgreSQL
+# Render crea todo de una sola vez al hacer "New → Blueprint"
+
+services:
+
+  # ── Backend: Spring Boot ──────────────────────────────────
+  - type: web
+    name: triage-backend
+    runtime: docker                        # Usa el Dockerfile del proyecto
+    dockerfilePath: ./triage-backend/Dockerfile
+    dockerContext: ./triage-backend
+    plan: free                             # Tier gratuito (tiene sleep de 15 min)
+    region: oregon
+    branch: main
+    healthCheckPath: /actuator/health      # Render verifica que el servicio esté vivo
+    envVars:
+      - key: SPRING_PROFILES_ACTIVE
+        value: prod
+
+      # fromDatabase conecta automáticamente con la BD definida abajo
+      # Render inyecta la connectionString sin que tengas que copiar credenciales
+      - key: DATABASE_URL
+        fromDatabase:
+          name: triage-db
+          property: connectionString
+
+      - key: DATABASE_USERNAME
+        fromDatabase:
+          name: triage-db
+          property: user
+
+      - key: DATABASE_PASSWORD
+        fromDatabase:
+          name: triage-db
+          property: password
+
+      # sync: false → el valor se ingresa manualmente en la UI de Render
+      # Nunca guardés el JWT_SECRET en el repositorio
+      - key: JWT_SECRET
+        sync: false
+
+      - key: JWT_EXPIRATION
+        value: "86400000"            # 24 horas en milisegundos
+
+      # URL del frontend para configurar CORS en Spring Boot
+      # ⚠️  Actualizá con el nombre real de tu Static Site
+      - key: FRONTEND_URL
+        value: https://triage-frontend.onrender.com
+
+      - key: SWAGGER_ENABLED
+        value: "false"
+
+  # ── Frontend: Angular Static Site ────────────────────────
+  - type: web
+    name: triage-frontend
+    runtime: static                        # Static Site — CDN, sin sleep
+    rootDir: ./triage-frontend             # Subdirectorio en el monorepo
+    buildCommand: npm ci && npx ng build --configuration production
+    staticPublishPath: ./dist/triage-frontend/browser
+    branch: main
+
+    # routes reemplaza el archivo _redirects para Angular SPA routing
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+
+    # Headers de seguridad para todas las rutas
+    headers:
+      - path: /*
+        name: X-Content-Type-Options
+        value: nosniff
+      - path: /*
+        name: X-Frame-Options
+        value: SAMEORIGIN
+      - path: /*
+        name: X-XSS-Protection
+        value: "1; mode=block"
+
+# ── Base de datos: PostgreSQL ─────────────────────────────
+databases:
+  - name: triage-db
+    plan: free                             # Gratuito por 90 días
+    databaseName: triage_production
+    user: triage_user
+    region: oregon                         # Misma región que los servicios
+```
+
+**Cómo activar el `render.yaml`:**
+
+1. Commiteá el archivo a la raíz del repositorio y hacé push
+2. En Render Dashboard → **"New +"** → **"Blueprint"**
+3. Seleccioná tu repositorio de GitHub
+4. Render detecta el `render.yaml` y te muestra un preview de los servicios que va a crear
+5. Los campos marcados con `sync: false` (como `JWT_SECRET`) te los va a pedir en ese momento — nunca los lee del archivo
+6. Confirmá y Render crea todo automáticamente
+
+> **`sync: false` y los secrets:** este flag le dice a Render que el valor no está en el repositorio y debe ingresarse manualmente en la UI. Es la forma correcta de manejar secrets en el `render.yaml` — el archivo puede estar en Git sin exponer credenciales.
+
+---
+
+### 12.5.4 El `cd.yml` para el escenario todo-Render
+
+Cuando usás Render para backend y frontend, el `cd.yml` usa **Deploy Hooks** en lugar de CLIs de plataforma. Un Deploy Hook es una URL que Render te da por servicio — cuando la llamás con un POST, Render descarga la nueva imagen (o recompila desde GitHub) y reinicia el servicio.
+
+```yaml
+# .github/workflows/cd-render.yml
+# Pipeline de CD para desplegar TODO en Render
+# Backend → Render Web Service (Docker)
+# Frontend → Render Static Site (build directo)
+#
+# Secrets necesarios en GitHub:
+#   RENDER_BACKEND_DEPLOY_HOOK  → Settings del Web Service → Deploy Hook
+#   RENDER_FRONTEND_DEPLOY_HOOK → Settings del Static Site → Deploy Hook
+#   GITHUB_TOKEN                → automático (para push a GHCR)
+
+name: CD — Despliegue Continuo (Todo en Render)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: production-render
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write    # Para hacer push a GHCR
+
+jobs:
+
+  # ── JOB 1: Construir y publicar imagen del backend en GHCR ──
+  # Render descargará esta imagen cuando reciba el Deploy Hook
+  build-and-push-backend:
+    name: Build Backend → GHCR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+
+      - name: Configurar Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login en GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}   # automático, sin secrets adicionales
+
+      - name: Build y Push imagen del backend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./triage-backend
+          dockerfile: ./triage-backend/Dockerfile
+          push: true
+          # La imagen queda en: ghcr.io/TU-USUARIO/TU-REPO/triage-backend:latest
+          tags: ghcr.io/${{ github.repository }}/triage-backend:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+
+  # ── JOB 2: Desplegar backend en Render ──────────────────────
+  deploy-backend:
+    name: Deploy Backend → Render Web Service
+    runs-on: ubuntu-latest
+    needs: build-and-push-backend
+
+    steps:
+      # Render detecta automáticamente que la imagen en GHCR cambió
+      # cuando recibe el Deploy Hook — descarga y reinicia el servicio
+      - name: Triggerear redeploy del backend en Render
+        run: |
+          curl -fsS -X POST "${{ secrets.RENDER_BACKEND_DEPLOY_HOOK }}"
+          echo "✅ Redeploy del backend iniciado"
+
+      # Esperar a que el backend esté activo (puede demorar hasta 3 min
+      # si el servicio estaba dormido — el deploy lo despierta)
+      - name: Verificar que el backend está activo
+        run: |
+          echo "⏳ Esperando que el backend esté listo..."
+          MAX_INTENTOS=18
+          INTENTOS=0
+          # ⚠️  Reemplazá la URL con la real de tu servicio en Render
+          HEALTH_URL="https://triage-backend.onrender.com/actuator/health"
+          until curl -sf "$HEALTH_URL" | grep -q '"status":"UP"'; do
+            INTENTOS=$((INTENTOS + 1))
+            if [ "$INTENTOS" -ge "$MAX_INTENTOS" ]; then
+              echo "❌ Timeout: el backend no respondió en 3 minutos"
+              exit 1
+            fi
+            echo "⏳ Intento $INTENTOS/$MAX_INTENTOS — esperando 10s..."
+            sleep 10
+          done
+          echo "✅ Backend activo y saludable"
+
+  # ── JOB 3: Desplegar frontend en Render Static Site ─────────
+  # El frontend NO depende del backend — corren en paralelo
+  deploy-frontend:
+    name: Deploy Frontend → Render Static Site
+    runs-on: ubuntu-latest
+    # No necesita build-and-push-backend: el static site compila su propio código
+
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+
+      - name: Configurar Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: triage-frontend/package-lock.json
+
+      - name: Instalar dependencias
+        working-directory: ./triage-frontend
+        run: npm ci --frozen-lockfile
+
+      - name: Build de producción
+        working-directory: ./triage-frontend
+        run: npx ng build --configuration production
+
+      - name: Verificar output del build
+        run: |
+          if [ ! -f triage-frontend/dist/triage-frontend/browser/index.html ]; then
+            echo "❌ index.html no encontrado en el output del build"
+            exit 1
+          fi
+          echo "✅ Build verificado"
+
+      # Render Static Sites detecta el push a main y redespliega automáticamente
+      # si está conectado al repo. El Deploy Hook es para forzar un redeploy:
+      - name: Triggerear redeploy del frontend en Render
+        run: |
+          curl -fsS -X POST "${{ secrets.RENDER_FRONTEND_DEPLOY_HOOK }}"
+          echo "✅ Redeploy del frontend iniciado"
+
+  # ── JOB 4: Resumen ──────────────────────────────────────────
+  notify:
+    name: Notificación del resultado
+    runs-on: ubuntu-latest
+    needs: [deploy-backend, deploy-frontend]
+    if: always()
+
+    steps:
+      - name: Resumen del despliegue
+        run: |
+          echo "## CD Render — Resultado del despliegue" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Servicio | Plataforma | Estado |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Backend  | Render Web Service  | ${{ needs.deploy-backend.result == 'success' && '✅ Éxito' || '❌ Falló' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Frontend | Render Static Site  | ${{ needs.deploy-frontend.result == 'success' && '✅ Éxito' || '❌ Falló' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**URLs:**" >> $GITHUB_STEP_SUMMARY
+          echo "- Backend:  https://triage-backend.onrender.com" >> $GITHUB_STEP_SUMMARY
+          echo "- Frontend: https://triage-frontend.onrender.com" >> $GITHUB_STEP_SUMMARY
+
+      - name: Fallo del pipeline
+        if: needs.deploy-backend.result == 'failure' || needs.deploy-frontend.result == 'failure'
+        run: exit 1
+```
+
+**Secrets que necesitás configurar en GitHub para este cd.yml:**
+
+| Secret | Dónde obtenerlo |
+|---|---|
+| `RENDER_BACKEND_DEPLOY_HOOK` | Dashboard Render → Web Service → Settings → Deploy Hook |
+| `RENDER_FRONTEND_DEPLOY_HOOK` | Dashboard Render → Static Site → Settings → Deploy Hook |
+| `GITHUB_TOKEN` | Automático — no lo creás vos |
+
+---
+
+### 12.5.5 Tabla resumen: escenarios completos de despliegue
+
+Después de ver Railway, Vercel, GHCR y Render, estos son los cuatro escenarios más comunes para el proyecto Triage. Elegí según lo que más se adapte a tus necesidades:
+
+| Escenario | Backend | Frontend | Base de Datos | Registry | Costo estimado |
+|---|---|---|---|---|---|
+| **A — Referencia** | Railway | Vercel | Railway PostgreSQL | Docker Hub | ~$0 (créditos Railway) |
+| **B — Todo GitHub** | Railway | Vercel | Railway PostgreSQL | GHCR | ~$0 (sin Docker Hub) |
+| **C — Todo Render** | Render Web Service | Render Static Site | Render PostgreSQL | GHCR | $0 (90 días BD gratis) |
+| **D — Híbrido** | Render Web Service | Vercel | Railway PostgreSQL | GHCR | ~$0 |
+
+**¿Qué `environment.prod.ts` corresponde a cada escenario?**
+
+| Escenario | `apiUrl` | ¿CORS en Spring Boot? |
+|---|---|---|
+| **A** — Railway + Vercel | `/api/v1` (relativo — proxy de Vercel) | No (el proxy es server-side) |
+| **B** — Railway + Vercel + GHCR | `/api/v1` (relativo — proxy de Vercel) | No |
+| **C** — Todo Render | `https://triage-backend.onrender.com/api/v1` (absoluto) | **Sí** — necesario |
+| **D** — Render backend + Vercel frontend | `/api/v1` (relativo — proxy de Vercel) | No |
+
+**¿Qué secrets necesitás en GitHub para cada escenario?**
+
+| Secret | A | B | C | D |
+|---|---|---|---|---|
+| `DOCKER_HUB_USERNAME` | ✅ | ❌ | ❌ | ❌ |
+| `DOCKER_HUB_TOKEN` | ✅ | ❌ | ❌ | ❌ |
+| `GITHUB_TOKEN` (automático) | ❌ | ✅ | ✅ | ✅ |
+| `RAILWAY_TOKEN` | ✅ | ✅ | ❌ | ✅ |
+| `RENDER_BACKEND_DEPLOY_HOOK` | ❌ | ❌ | ✅ | ✅ |
+| `RENDER_FRONTEND_DEPLOY_HOOK` | ❌ | ❌ | ✅ | ❌ |
+| `VERCEL_TOKEN` | ✅ | ✅ | ❌ | ✅ |
+| `VERCEL_ORG_ID` | ✅ | ✅ | ❌ | ✅ |
+| `VERCEL_PROJECT_ID` | ✅ | ✅ | ❌ | ✅ |
+
+> **Recomendación para la materia:** empezá con el **Escenario A** (Railway + Vercel) que es el más documentado y el que usaron las guías anteriores. Si querés explorar más, pasá al **Escenario C** (todo Render) porque simplifica la gestión al tener todo en un solo dashboard.
+
 ---
 
 ## 13. Despliegue del Frontend en Vercel
@@ -1812,7 +3243,7 @@ Crea un archivo `vercel.json` en la raíz de `triage-frontend/`:
 }
 ```
 
-Con esto, las peticiones a `https://triage.vercel.app/api/v1/solicitudes` se redirigen automáticamente a `https://triage-backend-production.up.railway.app/api/v1/solicitudes` sin pasar por el navegador. No hay CORS porque la redirección ocurre en el servidor de Vercel.
+Con esto, las peticiones a `https://triage.vercel.app/api/v1/solicitudes` se redirigen automáticamente a `https://triage-backend-production.up.railway.app/api/v1/solicitudes` sin pasar por el navegador. No hay CORS porque la redirección ocurre en el servidor de Vercel. (el mismo principio del proxy inverso explicado en la sección 7).
 
 ### Deploy automático desde GitHub
 
@@ -1825,6 +3256,85 @@ Una vez configurado el proyecto en Vercel, cada `git push` a la rama `main` disp
 5. La URL de producción se actualiza en ~30 segundos
 
 Vercel también crea **Preview Deployments** para cada Pull Request, permitiéndote probar los cambios antes de mergear a main.
+
+---
+
+### El vercel.json definitivo
+
+El `vercel.json` básico de la sección anterior resuelve el problema de CORS, pero en producción conviene agregar también **headers de seguridad**. Reemplaza el `vercel.json` de `triage-frontend/` por esta versión completa:
+
+```json
+{
+  "rewrites": [
+    {
+      "source": "/api/:path*",
+      "destination": "https://triage-backend-production.up.railway.app/api/:path*"
+    }
+  ],
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        {
+          "key": "X-Content-Type-Options",
+          "value": "nosniff"
+        },
+        {
+          "key": "X-Frame-Options",
+          "value": "SAMEORIGIN"
+        },
+        {
+          "key": "X-XSS-Protection",
+          "value": "1; mode=block"
+        }
+      ]
+    }
+  ]
+}
+```
+
+**¿Qué hace cada parte?**
+
+- `rewrites`: Redirige server-side las peticiones a `/api/*` hacia Railway. El navegador nunca ve el dominio de Railway, por eso no hay CORS.
+- `X-Content-Type-Options: nosniff`: Evita que el navegador intente "adivinar" el tipo de contenido de las respuestas. Previene ataques de sniffing de MIME.
+- `X-Frame-Options: SAMEORIGIN`: Impide que tu app sea embebida en un `<iframe>` de otro dominio. Protege contra clickjacking.
+- `X-XSS-Protection: 1; mode=block`: Activa el filtro XSS del navegador y bloquea la página si detecta un ataque (legacy, pero harmless en navegadores modernos).
+
+---
+
+### El `environment.prod.ts` correcto para Vercel
+
+Cuando el frontend está en Vercel (con el proxy del `vercel.json`), la `apiUrl` **debe ser relativa**, no absoluta. Así debería quedar `src/environments/environment.prod.ts`:
+
+```typescript
+// src/environments/environment.prod.ts
+
+export const environment = {
+  production: true,
+
+  // URL relativa: '/api/v1' en lugar de 'https://triage-api.railway.app/api/v1'
+  //
+  // ¿Por qué relativa?
+  // Cuando Angular hace una petición a '/api/v1/solicitudes', el navegador
+  // la convierte en 'https://triage.vercel.app/api/v1/solicitudes'.
+  // Vercel intercepta esa petición (gracias al rewrite en vercel.json) y la
+  // redirige server-side a 'https://triage-backend-production.up.railway.app/api/v1/solicitudes'.
+  //
+  // Si usáramos la URL absoluta de Railway, el navegador haría la petición
+  // directamente a railway.app (cross-origin) y necesitaríamos CORS configurado
+  // en Spring Boot con el dominio exacto de Vercel. Al usar la URL relativa,
+  // el navegador nunca sabe que existe Railway: todo parece venir del mismo
+  // origen (vercel.app), así que no hay CORS en absoluto.
+  apiUrl: '/api/v1',
+
+  appName: 'Sistema de Triage Académico - UniQuindío'
+};
+```
+
+> **Resumen de la relación entre estas tres piezas:**
+> 1. `vercel.json` define que `/api/*` se reescribe hacia Railway (server-side)
+> 2. `environment.prod.ts` hace que Angular use `/api/v1` como base URL
+> 3. Spring Boot no necesita configurar CORS para el dominio de Vercel, porque el navegador nunca hace peticiones cross-origin
 
 ---
 
@@ -2051,6 +3561,26 @@ app:
 [ ] Las consultas JPA frecuentes tienen índices en la BD
 ```
 
+### Checklist específico para proyectos Gradle
+
+Si tu proyecto usa Gradle en lugar de Maven, verificá además estos puntos:
+
+```
+[ ] gradlew está en el repositorio (NOT en .gitignore)
+[ ] gradlew.bat está en el repositorio
+[ ] gradle/wrapper/gradle-wrapper.jar está en el repositorio (es un binario pero debe estar)
+[ ] gradle/wrapper/gradle-wrapper.properties especifica la versión correcta de Gradle
+[ ] ./gradlew bootJar funciona localmente sin errores antes de hacer push
+[ ] El JAR generado está en build/libs/ y pesa más de 10MB (si pesa menos, es el plain JAR)
+[ ] .dockerignore excluye build/ y .gradle/ (pero NO gradlew ni gradle/wrapper/)
+[ ] En el Dockerfile, el COPY del JAR usa el patrón build/libs/*-[0-9]*.jar
+[ ] En ci.yml y cd.yml, el cache de setup-java es cache: 'gradle' (no 'maven')
+[ ] El paso chmod +x gradlew está en el workflow de CI/CD
+[ ] Preferentemente, git update-index --chmod=+x gradlew ya está commiteado (solución permanente)
+[ ] Los reportes de tests están en build/test-results/test/*.xml (no en target/surefire-reports/)
+[ ] Los tests corren con ./gradlew test --no-daemon sin necesitar BD externa (H2 en memoria)
+```
+
 ---
 
 ## 16. Errores Comunes y Troubleshooting
@@ -2236,6 +3766,150 @@ services:
 
 ---
 
+### Errores específicos de Gradle en CI/CD
+
+#### Error Gradle 1: `Permission denied: ./gradlew`
+
+**Síntoma:** El workflow falla en el paso `chmod` o en `./gradlew ...` con:
+```
+/bin/sh: ./gradlew: Permission denied
+```
+
+**Causa:** Git no preserva los permisos de ejecución de Linux cuando el archivo fue creado en Windows. El archivo `gradlew` llegó al repositorio sin el bit `+x`.
+
+**Solución permanente (hacerlo una sola vez):**
+```bash
+# Desde la raíz del proyecto backend
+git update-index --chmod=+x gradlew
+git commit -m "fix: permisos de ejecución del Gradle Wrapper"
+git push
+```
+
+**Solución temporal (parche en cada build):**
+```yaml
+# En el workflow de CI/CD, agregar antes de cualquier ./gradlew:
+- name: Dar permisos al Gradle Wrapper
+  working-directory: ./triage-backend
+  run: chmod +x gradlew
+```
+
+---
+
+#### Error Gradle 2: `Could not find or load main class org.gradle.wrapper.GradleWrapperMain`
+
+**Síntoma:** El build falla con:
+```
+Error: Could not find or load main class org.gradle.wrapper.GradleWrapperMain
+Caused by: java.lang.ClassNotFoundException: org.gradle.wrapper.GradleWrapperMain
+```
+
+**Causa:** El archivo `gradle/wrapper/gradle-wrapper.jar` no está en el repositorio. Probablemente fue excluido por `.gitignore` o nunca fue commiteado.
+
+**Solución:**
+```bash
+# Verificar que el archivo existe localmente
+ls gradle/wrapper/gradle-wrapper.jar
+
+# Si existe, agregarlo al repositorio (puede estar siendo ignorado)
+git add -f gradle/wrapper/gradle-wrapper.jar
+git commit -m "fix: agregar gradle-wrapper.jar al repositorio"
+git push
+
+# Si no existe, regenerar el wrapper desde Gradle (necesita Gradle instalado localmente)
+gradle wrapper --gradle-version 8.11
+git add gradle/
+git commit -m "feat: agregar Gradle Wrapper 8.11"
+git push
+```
+
+---
+
+#### Error Gradle 3: `FAILURE: Build failed — Could not resolve com.example:dependency`
+
+**Síntoma:** El build falla al resolver dependencias:
+```
+FAILURE: Build failed with an exception.
+> Could not resolve org.springframework.boot:spring-boot-starter-web:3.x.x
+  > Could not get resource 'https://repo.spring.io/milestone/...'
+```
+
+**Causa:** La red del servidor de CI bloqueó el repositorio de Spring Milestones, o el paso de pre-descarga de dependencias falló y no se cacheó correctamente.
+
+**Solución 1** — Usar el `|| true` en el pre-fetch para que no falle el caché:
+```dockerfile
+# En el Dockerfile
+RUN ./gradlew dependencies --no-daemon || true
+```
+
+**Solución 2** — Configurar el repositorio de Maven Central explícitamente en `build.gradle`:
+```groovy
+repositories {
+    mavenCentral()
+    // Solo agregar si realmente usás dependencias de milestone de Spring:
+    // maven { url 'https://repo.spring.io/milestone' }
+}
+```
+
+---
+
+#### Error Gradle 4: `Expiring Daemon because JVM heap space is exhausted`
+
+**Síntoma:** El build falla o se detiene con:
+```
+Expiring Daemon because JVM heap space is exhausted
+java.lang.OutOfMemoryError: Java heap space
+```
+
+**Causa:** El daemon de Gradle mantiene estado en memoria entre ejecuciones. En CI (entornos efímeros con RAM limitada), el daemon acumula memoria hasta que el sistema lo mata.
+
+**Solución:** Siempre usar `--no-daemon` en CI:
+```yaml
+# En todos los pasos que llaman a ./gradlew en el workflow:
+- name: Build
+  run: ./gradlew bootJar -x test --no-daemon
+#                                  ↑ fundamental en CI
+
+- name: Test
+  run: ./gradlew test --no-daemon
+```
+
+También podés desactivar el daemon globalmente para el proyecto creando `gradle.properties`:
+```properties
+# gradle.properties (en la raíz del proyecto)
+org.gradle.daemon=false    # deshabilitar daemon (recomendado para proyectos estudiantiles)
+org.gradle.parallel=false  # deshabilitar builds paralelos (más predecible en CI)
+```
+
+---
+
+#### Error Gradle 5: Hay dos JARs en `build/libs/` y el Docker COPY falla
+
+**Síntoma:** El build de Docker falla con:
+```
+COPY failed: expected a single source argument
+```
+O el contenedor inicia pero no responde porque levantó el JAR incorrecto.
+
+**Causa:** Gradle genera dos JARs:
+- `triage-backend-0.0.1-SNAPSHOT.jar` — el fat JAR (el que querés)
+- `triage-backend-0.0.1-SNAPSHOT-plain.jar` — solo tus clases sin dependencias
+
+**Solución A** — Usar el patrón correcto en el Dockerfile:
+```dockerfile
+# Patrón que coincide solo con el fat JAR (tiene número de versión)
+COPY --from=build /app/build/libs/*-[0-9]*.jar triage-backend.jar
+```
+
+**Solución B** — Deshabilitar la generación del plain JAR en `build.gradle`:
+```groovy
+// build.gradle
+jar {
+    enabled = false    // Solo generar el fat JAR (bootJar), no el plain JAR
+}
+```
+
+---
+
 ## 17. Resumen y Cheat Sheet
 
 ### Docker — Comandos esenciales
@@ -2353,12 +4027,27 @@ jobs:
 
 | Característica | Railway | Render | Fly.io | Heroku |
 |---|---|---|---|---|
-| **Capa gratuita** | $5 crédito/mes | Sí (con limitaciones) | Sí | No |
-| **PostgreSQL** | ✅ Gestionado | ✅ Gestionado | ✅ | ✅ |
+| **Capa gratuita** | $5 crédito/mes | Permanente (con sleep) | Sí | No |
+| **PostgreSQL** | ✅ Gestionado | ✅ 90 días gratis | ✅ | ✅ |
+| **Sleep en inactividad** | No | Sí (15 min) | No | Sí (antiguo) |
 | **Deploy desde Docker Hub** | ✅ | ✅ | ✅ | ✅ |
-| **Deploy desde GitHub** | ✅ | ✅ | Partial | ✅ |
+| **Deploy desde GHCR** | ✅ | ✅ | ✅ | Parcial |
+| **Deploy desde GitHub** | ✅ | ✅ | Parcial | ✅ |
+| **Deploy Hook (CD externo)** | ✅ | ✅ | Sí (via API) | ✅ |
 | **Facilidad de uso** | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐ | ⭐⭐⭐ | ⭐⭐⭐⭐ |
-| **Ideal para** | Proyectos estudiantiles | APIs y servicios | Apps de producción | Proyectos maduros |
+| **Ideal para** | Proyectos estudiantiles | Tier gratuito permanente | Apps de producción | Proyectos maduros |
+
+#### Comparativa de registries de imágenes Docker
+
+| Característica | Docker Hub | GHCR |
+|---|---|---|
+| **Cuenta separada** | Sí (hub.docker.com) | No (usa tu cuenta de GitHub) |
+| **Secrets en GitHub Actions** | 2 adicionales | 0 (GITHUB_TOKEN es automático) |
+| **URL de imagen** | `usuario/imagen:tag` | `ghcr.io/usuario/repo/imagen:tag` |
+| **Pulls anónimos** | 100/hora | Ilimitados (repos públicos) |
+| **Visibilidad** | Pública por defecto | Sigue al repositorio de GitHub |
+| **Dónde se ven las imágenes** | hub.docker.com | Pestaña "Packages" del repo en GitHub |
+| **Ideal para** | Distribución pública amplia | Proyectos en GitHub (estudiantes) |
 
 ---
 
